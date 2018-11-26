@@ -1,0 +1,179 @@
+/* **********************************************************************
+ * Copyright 2012 VMware, Inc.  All rights reserved. VMware Confidential
+ * **********************************************************************
+ * $Id$
+ * $DateTime$
+ * $Change$
+ * $Author$
+ * *********************************************************************/
+package com.vmware.systest.tests.stsds.workload;
+
+import java.io.File;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
+
+import com.vmware.systest.lib.stlib.op.vm.VirtualMachineHelper;
+import com.vmware.systest.lib.workloadmanagement.ClientServerWorkload;
+import com.vmware.systest.lib.workloadmanagement.StandaloneWorkload;
+import com.vmware.systest.lib.workloadmanagement.Workload;
+import com.vmware.systest.tests.stsds.common.CircularPairingAlgorithm;
+import com.vmware.systest.tests.stsds.common.IPairingAlgorithm;
+import com.vmware.systest.tests.stsds.common.VmNameRepository;
+import com.vmware.systest.tests.stsds.lib.util.NetworkUtil;
+import com.vmware.vc.VirtualMachineToolsRunningStatus;
+import com.vmware.vcqa.ConnectAnchor;
+
+/**
+ * A helper function to create workload, WorkloadConllection, WorkloadController
+ * 
+ * @author pwen
+ * 
+ */
+public class WorkloadHelper {
+    private static Logger log = LoggerFactory.getLogger(WorkloadHelper.class);
+    private ConnectAnchor anchor = null;
+    public static final String STANDALONE_WORKLOAD_PROPERTY_FILE = "stsds/PropertyFiles/Standalone.property";
+    public static final String CLIENT_SERVER_WORKLOAD_PROPERTY_FILE = "stsds/PropertyFiles/ClientServer.property";
+
+    public WorkloadHelper(ConnectAnchor anchor) {
+        this.anchor = anchor;
+
+    }
+
+    public HashMap<String, Workload> createWorkloadMap(String workloadType, List<String> vmNames,
+            List<String> skippedVmNames) {
+        HashMap<String, Workload> vmNameToWorkloadMap = new HashMap<String, Workload>();
+        skippedVmNames.clear();
+        if (vmNames == null || vmNames.size() == 0) {
+            log.warn("No Workload will be created!!");
+            return vmNameToWorkloadMap;
+        }
+
+        String logFile = MDC.get("testcaseName");
+        String logFolder = logFile.substring(0, logFile.lastIndexOf(File.separator) + 1) + "WorkloadLog";
+
+        VirtualMachineHelper vmHelper = new VirtualMachineHelper(vmNames);
+        HashMap<String, String> vmNameToToolsState = vmHelper.getToolsRunningStatus();
+        HashMap<String, String> vmNameToIp = vmHelper.getIpAddress();
+
+        if (workloadType.equals("netperf") || workloadType.equals("iperf")) {
+            // for client/server workload
+            VmNameRepository vmRepository = new VmNameRepository(vmNames);
+
+            // create client/server map based on host number
+            HashMap<String, List<String>> hostNumberToVmNameMap = vmRepository.groupByHost();
+            List<String> hostNumbers = new ArrayList<String>(hostNumberToVmNameMap.keySet());
+            IPairingAlgorithm pairingAlgorithm = new CircularPairingAlgorithm();
+            HashMap<String, String> clientHostNumberToServerHostNumberMap = pairingAlgorithm.createPairMap(hostNumbers);
+
+            // create client server workload instance
+            for (String hostNumber : hostNumbers) {
+                List<String> clientVms = hostNumberToVmNameMap.get(hostNumber);
+                List<String> serverVms = hostNumberToVmNameMap.get(clientHostNumberToServerHostNumberMap
+                        .get(hostNumber));
+
+                int i = 0;
+                while (i < clientVms.size() && i < serverVms.size()) {
+                    try {
+                        ClientServerWorkload workload = new ClientServerWorkload(anchor, clientVms.get(i),
+                                Arrays.asList(serverVms.get(i)), workloadType, CLIENT_SERVER_WORKLOAD_PROPERTY_FILE);
+                        workload.setLocalLogDir(logFolder);
+                        vmNameToWorkloadMap.put(clientVms.get(i), workload);
+
+                        if (VirtualMachineToolsRunningStatus.GUEST_TOOLS_RUNNING.value().equals(
+                                vmNameToToolsState.get(clientVms.get(i)))
+                                && VirtualMachineToolsRunningStatus.GUEST_TOOLS_RUNNING.value().equals(
+                                        vmNameToToolsState.get(serverVms.get(i)))) {
+                            if (NetworkUtil.isValidIpv4Address(vmNameToIp.get(clientVms.get(i)))
+                                    && NetworkUtil.isValidIpv4Address(vmNameToIp.get(serverVms.get(i)))) {
+                                log.info("Start network workload between VM " + clientVms.get(i) + " and "
+                                        + serverVms.get(i));
+                            } else {
+                                log.warn("skip starting workload in Vm " + clientVms.get(i)
+                                        + ", vm does not have a valid IPV4 address.");
+                                skippedVmNames.add(clientVms.get(i));
+                            }
+                        } else {
+                            log.warn("Skip starting workload in Vm " + clientVms.get(i) + ", vm tools is not running.");
+                            skippedVmNames.add(clientVms.get(i));
+                        }
+                    } catch (Exception e) {
+                        log.error("Failed to create workload.", e);
+                    }
+                    i++;
+                }
+            }
+        } else {
+            // for standalone workload
+            for (String vmName : vmNames) {
+
+                if (!vmHelper.exists(vmName)) {
+                    log.warn("VM " + vmName + " is not found!");
+                    continue;
+                }
+                try {
+                    StandaloneWorkload workload = new StandaloneWorkload(anchor, vmName, workloadType,
+                            STANDALONE_WORKLOAD_PROPERTY_FILE);
+                    workload.setLocalLogDir(logFolder);
+                    vmNameToWorkloadMap.put(vmName, workload);
+                    if (!VirtualMachineToolsRunningStatus.GUEST_TOOLS_RUNNING.value().equals(
+                            vmNameToToolsState.get(vmName))) {
+                        log.warn("Skip starting workload in Vm " + vmName + ", vm tools is not running.");
+                        skippedVmNames.add(vmName);
+                    }
+                } catch (Exception e) {
+                    log.error("Failed to create workload.", e);
+                }
+            }
+        }
+        return vmNameToWorkloadMap;
+    }
+
+    public List<Workload> createWorkloads(String workloadType, List<String> vmNames) {
+        List<String> skippedVmNames = new ArrayList<String>();
+        HashMap<String, Workload> vmNameToWorkloadMap = createWorkloadMap(workloadType, vmNames, skippedVmNames);
+        List<Workload> workloads = new ArrayList<Workload>();
+        for (String vmName : vmNames) {
+            if (vmNameToWorkloadMap.get(vmName) != null) {
+                workloads.add(vmNameToWorkloadMap.get(vmName));
+            }
+        }
+        return workloads;
+    }
+
+    public WorkloadCollection createWorkloadCollectionByLevel(String workloadLevel, List<String> vmNames) {
+        List<String> skippedVmNames = new ArrayList<String>();
+        WorkloadLevelHelper levelHelper = new WorkloadLevelHelper(workloadLevel, new VmNameRepository(vmNames));
+        HashMap<String, List<String>> workloadToVmListMap = levelHelper.getVmNameToWorkloadTypeMap();
+
+        WorkloadCollection workloadCollection = new WorkloadCollection();
+
+        log.info("Prepare workload level : " + workloadLevel);
+        for (String workloadType : workloadToVmListMap.keySet()) {
+            List<String> vmList = workloadToVmListMap.get(workloadType);
+
+            log.info("start workload " + workloadType + " in the following " + vmList.size() + " Vms ");
+            log.info("---------------------------------------------------------");
+            for (String vmName : vmList) {
+                log.info("    " + vmName);
+            }
+            HashMap<String, Workload> workloads = this.createWorkloadMap(workloadType, vmList, skippedVmNames);
+            workloadCollection.add(workloads, skippedVmNames);
+        }
+        return workloadCollection;
+    }
+
+    public WorkloadCollection createWorkloadCollection(String workloadType, List<String> vmNames) {
+        List<String> skippedVmNames = new ArrayList<String>();
+        WorkloadCollection workloadCollection = new WorkloadCollection();
+        HashMap<String, Workload> workloads = this.createWorkloadMap(workloadType, vmNames, skippedVmNames);
+        workloadCollection.add(workloads, skippedVmNames);
+        return workloadCollection;
+    }
+}
